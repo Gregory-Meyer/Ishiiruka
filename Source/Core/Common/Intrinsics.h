@@ -12,6 +12,10 @@
 #include <x86intrin.h>
 #endif
 
+#ifdef _M_ARM_64
+#include <arm_neon.h>
+#endif
+
 #if defined _M_GENERIC
 #  define _M_SSE 0
 #elif _MSC_VER || __INTEL_COMPILER

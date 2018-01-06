@@ -289,6 +289,106 @@ void ResetVideoBuffer()
 	s_fifo_aux_read_ptr = s_fifo_aux_data;
 }
 
+// this shouldn't be a lambda, since it's almost 100 lines
+static void DoGpuLoopWork()
+{
+	const SConfig& param = SConfig::GetInstance();
+
+	g_video_backend->PeekMessages();
+
+	// Do nothing while paused
+	if (!s_emu_running_state.IsSet())
+		return;
+
+	// hopefully this won't be a null pointer deref, because that's really bad
+	// design for a singleton to return nullptr
+	AsyncRequests& requests = *AsyncRequests::GetInstance();
+
+	if (s_use_deterministic_gpu_thread)
+	{
+		requests.PullEvents();
+
+		// All the fifo/CP stuff is on the CPU.  We just need to run the opcode decoder.
+		u8* seen_ptr = s_video_buffer_seen_ptr;
+		u8* write_ptr = s_video_buffer_write_ptr;
+		// See comment in SyncGPU
+		if (write_ptr > seen_ptr)
+		{
+			g_VideoData.SetReadPosition(s_video_buffer_read_ptr, write_ptr);
+			s_video_buffer_read_ptr = OpcodeDecoder::Run<false>(g_VideoData, nullptr);
+			s_video_buffer_seen_ptr = write_ptr;
+		}
+	}
+	else
+	{
+		SCPFifoStruct& fifo = CommandProcessor::fifo;
+
+		requests.PullEvents();
+
+		CommandProcessor::SetCPStatusFromGPU();
+
+		// check if we are able to run this buffer
+		while (!CommandProcessor::IsInterruptWaiting() && fifo.bFF_GPReadEnable &&
+			fifo.CPReadWriteDistance && !AtBreakpoint())
+		{
+			if (param.bSyncGPU && s_sync_ticks.load() < param.iSyncGpuMinDistance)
+				break;
+
+			u32 cyclesExecuted = 0;
+			u32 readPtr = fifo.CPReadPointer;
+			ReadDataFromFifo(readPtr);
+
+			if (readPtr == fifo.CPEnd)
+				readPtr = fifo.CPBase;
+			else
+				readPtr += 32;
+
+			_assert_msg_(COMMANDPROCESSOR, (s32)fifo.CPReadWriteDistance - 32 >= 0,
+				"Negative fifo.CPReadWriteDistance = %i in FIFO Loop !\nThat can produce "
+				"instability in the game. Please report it.",
+				fifo.CPReadWriteDistance - 32);
+
+			u8* write_ptr = s_video_buffer_write_ptr;
+			g_VideoData.SetReadPosition(s_video_buffer_read_ptr, write_ptr);
+			s_video_buffer_read_ptr = OpcodeDecoder::Run(g_VideoData, &cyclesExecuted);
+
+			Common::AtomicStore(fifo.CPReadPointer, readPtr);
+			Common::AtomicAdd(fifo.CPReadWriteDistance, -32);
+			if ((write_ptr - s_video_buffer_read_ptr) == 0)
+				Common::AtomicStore(fifo.SafeCPReadPointer, fifo.CPReadPointer);
+
+			CommandProcessor::SetCPStatusFromGPU();
+
+			if (param.bSyncGPU)
+			{
+				cyclesExecuted = (int)(cyclesExecuted / param.fSyncGpuOverclock);
+				int old = s_sync_ticks.fetch_sub(cyclesExecuted);
+				if (old >= param.iSyncGpuMaxDistance &&
+					old - (int)cyclesExecuted < param.iSyncGpuMaxDistance)
+					s_sync_wakeup_event.Set();
+			}
+
+			// This call is pretty important in DualCore mode and must be called in the FIFO Loop.
+			// If we don't, s_swapRequested or s_efbAccessRequested won't be set to false
+			// leading the CPU thread to wait in Video_BeginField or Video_AccessEFB thus slowing
+			// things down.
+			requests.PullEvents();
+		}
+
+		// fast skip remaining GPU time if fifo is empty
+		if (s_sync_ticks.load() > 0)
+		{
+			int old = s_sync_ticks.exchange(0);
+			if (old >= param.iSyncGpuMaxDistance)
+				s_sync_wakeup_event.Set();
+		}
+
+		// The fifo is empty and it's unlikely we will get any more work in the near future.
+		// Make sure VertexManager finishes drawing any primitives it has stored in it's buffer.
+		g_vertex_manager->Flush();
+	}
+}
+
 // Description: Main FIFO update loop
 // Purpose: Keep the Core HW updated about the CPU-GPU distance
 void RunGpuLoop()
@@ -296,101 +396,7 @@ void RunGpuLoop()
 	AsyncRequests::GetInstance()->SetEnable(true);
 	AsyncRequests::GetInstance()->SetPassthrough(false);
 
-	s_gpu_mainloop.Run(
-		[] {
-		const SConfig& param = SConfig::GetInstance();
-
-		g_video_backend->PeekMessages();
-
-		// Do nothing while paused
-		if (!s_emu_running_state.IsSet())
-			return;
-
-		if (s_use_deterministic_gpu_thread)
-		{
-			AsyncRequests::GetInstance()->PullEvents();
-
-			// All the fifo/CP stuff is on the CPU.  We just need to run the opcode decoder.
-			u8* seen_ptr = s_video_buffer_seen_ptr;
-			u8* write_ptr = s_video_buffer_write_ptr;
-			// See comment in SyncGPU
-			if (write_ptr > seen_ptr)
-			{
-				g_VideoData.SetReadPosition(s_video_buffer_read_ptr, write_ptr);
-				s_video_buffer_read_ptr = OpcodeDecoder::Run<false>(g_VideoData, nullptr);
-				s_video_buffer_seen_ptr = write_ptr;
-			}
-		}
-		else
-		{
-			SCPFifoStruct& fifo = CommandProcessor::fifo;
-
-			AsyncRequests::GetInstance()->PullEvents();
-
-			CommandProcessor::SetCPStatusFromGPU();
-
-			// check if we are able to run this buffer
-			while (!CommandProcessor::IsInterruptWaiting() && fifo.bFF_GPReadEnable &&
-				fifo.CPReadWriteDistance && !AtBreakpoint())
-			{
-				if (param.bSyncGPU && s_sync_ticks.load() < param.iSyncGpuMinDistance)
-					break;
-
-				u32 cyclesExecuted = 0;
-				u32 readPtr = fifo.CPReadPointer;
-				ReadDataFromFifo(readPtr);
-
-				if (readPtr == fifo.CPEnd)
-					readPtr = fifo.CPBase;
-				else
-					readPtr += 32;
-
-				_assert_msg_(COMMANDPROCESSOR, (s32)fifo.CPReadWriteDistance - 32 >= 0,
-					"Negative fifo.CPReadWriteDistance = %i in FIFO Loop !\nThat can produce "
-					"instability in the game. Please report it.",
-					fifo.CPReadWriteDistance - 32);
-
-				u8* write_ptr = s_video_buffer_write_ptr;
-				g_VideoData.SetReadPosition(s_video_buffer_read_ptr, write_ptr);
-				s_video_buffer_read_ptr = OpcodeDecoder::Run(g_VideoData, &cyclesExecuted);
-
-				Common::AtomicStore(fifo.CPReadPointer, readPtr);
-				Common::AtomicAdd(fifo.CPReadWriteDistance, -32);
-				if ((write_ptr - s_video_buffer_read_ptr) == 0)
-					Common::AtomicStore(fifo.SafeCPReadPointer, fifo.CPReadPointer);
-
-				CommandProcessor::SetCPStatusFromGPU();
-
-				if (param.bSyncGPU)
-				{
-					cyclesExecuted = (int)(cyclesExecuted / param.fSyncGpuOverclock);
-					int old = s_sync_ticks.fetch_sub(cyclesExecuted);
-					if (old >= param.iSyncGpuMaxDistance &&
-						old - (int)cyclesExecuted < param.iSyncGpuMaxDistance)
-						s_sync_wakeup_event.Set();
-				}
-
-				// This call is pretty important in DualCore mode and must be called in the FIFO Loop.
-				// If we don't, s_swapRequested or s_efbAccessRequested won't be set to false
-				// leading the CPU thread to wait in Video_BeginField or Video_AccessEFB thus slowing
-				// things down.
-				AsyncRequests::GetInstance()->PullEvents();
-			}
-
-			// fast skip remaining GPU time if fifo is empty
-			if (s_sync_ticks.load() > 0)
-			{
-				int old = s_sync_ticks.exchange(0);
-				if (old >= param.iSyncGpuMaxDistance)
-					s_sync_wakeup_event.Set();
-			}
-
-			// The fifo is empty and it's unlikely we will get any more work in the near future.
-			// Make sure VertexManager finishes drawing any primitives it has stored in it's buffer.
-			g_vertex_manager->Flush();
-		}
-	},
-		100);
+	s_gpu_mainloop.Run(DoGpuLoopWork, 100);
 
 	AsyncRequests::GetInstance()->SetEnable(false);
 	AsyncRequests::GetInstance()->SetPassthrough(true);

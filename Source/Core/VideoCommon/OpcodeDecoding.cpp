@@ -158,16 +158,43 @@ void Init()
 	s_bFifoErrorSeen = false;
 }
 
+namespace detail
+{
+
+template <typename F>
+class RunOnDestruct
+{
+public:
+	explicit RunOnDestruct(F&& f) : m_to_run(std::forward<F>(f)) { }
+
+	~RunOnDestruct() {
+		std::forward<F>(m_to_run)();
+	}
+
+private:
+	F&& m_to_run;
+};
+
+}
+
 template <bool is_preprocess, bool sizeCheck>
 u8* Run(DataReader& reader, u32* cycles)
 {
 	u32 totalCycles = 0;
 	u8* opcodeStart;
+
+	auto mutate_cycles = [&cycles, &totalCycles] {
+		if (cycles)
+			*cycles = totalCycles;
+	};
+
+	detail::RunOnDestruct<decltype(mutate_cycles)> runner(std::move(mutate_cycles));
+
 	while (true)
 	{
 		opcodeStart = reader.GetReadPosition();
 		if (!reader.size())
-			goto end;
+			return opcodeStart;
 
 		u8 cmd_byte = reader.Read<u8>();
 		size_t distance = reader.size();
@@ -188,7 +215,8 @@ u8* Run(DataReader& reader, u32* cycles)
 		case GX_LOAD_CP_REG:
 		{
 			if (sizeCheck && distance < GX_LOAD_CP_REG_SIZE)
-				goto end;
+				return opcodeStart;
+
 			totalCycles += GX_LOAD_CP_REG_CYCLES;
 			u8 sub_cmd = reader.Read<u8>();
 			u32 value = reader.Read<u32>();
@@ -200,12 +228,14 @@ u8* Run(DataReader& reader, u32* cycles)
 		case GX_LOAD_XF_REG:
 		{
 			if (sizeCheck && distance < GX_LOAD_XF_REG_SIZE)
-				goto end;
+				return opcodeStart;
+
 			u32 Cmd2 = reader.Read<u32>();
 			distance -= GX_LOAD_XF_REG_SIZE;
 			int transfer_size = ((Cmd2 >> 16) & 15) + 1;
 			if (sizeCheck && distance < (transfer_size * sizeof(u32)))
-				goto end;
+				return opcodeStart;
+
 			totalCycles += GX_LOAD_XF_REG_BASE_CYCLES + GX_LOAD_XF_REG_TRANSFER_CYCLES * transfer_size;
 			if (is_preprocess)
 			{
@@ -225,7 +255,8 @@ u8* Run(DataReader& reader, u32* cycles)
 		case GX_LOAD_INDX_D: //used for lights
 		{
 			if (sizeCheck && distance < GX_LOAD_INDX_SIZE)
-				goto end;
+				return opcodeStart;
+
 			totalCycles += GX_LOAD_INDX_CYCLES;
 			const s32 ref_array = (cmd_byte >> 3) + 8;
 			if (is_preprocess)
@@ -237,7 +268,8 @@ u8* Run(DataReader& reader, u32* cycles)
 		case GX_CMD_CALL_DL:
 		{
 			if (sizeCheck && distance < GX_CMD_CALL_DL_SIZE)
-				goto end;
+				return opcodeStart;
+
 			u32 address = reader.Read<u32>();
 			u32 count = reader.Read<u32>();
 			if (is_preprocess)
@@ -261,7 +293,8 @@ u8* Run(DataReader& reader, u32* cycles)
 		case GX_LOAD_BP_REG:
 		{
 			if (sizeCheck && distance < GX_LOAD_BP_REG_SIZE)
-				goto end;
+				return opcodeStart;
+
 			totalCycles += GX_LOAD_BP_REG_CYCLES;
 			u32 bp_cmd = reader.Read<u32>();
 			if (is_preprocess)
@@ -281,7 +314,7 @@ u8* Run(DataReader& reader, u32* cycles)
 			{
 				// load vertices
 				if (sizeCheck && distance < GX_DRAW_PRIMITIVES_SIZE)
-					goto end;
+					return opcodeStart;
 
 				u32 count = reader.Read<u16>();
 				distance -= GX_DRAW_PRIMITIVES_SIZE;
@@ -316,7 +349,7 @@ u8* Run(DataReader& reader, u32* cycles)
 						}
 						else
 						{
-							goto end;
+							return opcodeStart;
 						}
 					}
 					else
@@ -330,7 +363,7 @@ u8* Run(DataReader& reader, u32* cycles)
 						}
 						else
 						{
-							goto end;
+							return opcodeStart;
 						}
 					}
 				}
@@ -358,11 +391,7 @@ u8* Run(DataReader& reader, u32* cycles)
 			FifoRecorder::GetInstance().WriteGPCommand(opcodeStart, u32(opcodeEnd - opcodeStart));
 		}
 	}
-end:
-	if (cycles)
-	{
-		*cycles = totalCycles;
-	}
+
 	return opcodeStart;
 }
 

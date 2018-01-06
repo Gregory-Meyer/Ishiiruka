@@ -36,3 +36,4 @@ CMakeLists.txt.user
 /.idea/
 # Ignore Visual Studio performance profiling data
 *.psess
+*.vspx

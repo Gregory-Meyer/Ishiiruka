@@ -7,6 +7,7 @@
 #include <atomic>
 #include <mutex>
 #include <thread>
+#include <utility>
 
 #include "Common/Event.h"
 #include "Common/Flag.h"
@@ -120,7 +121,7 @@ public:
 	// The payload callback is called at least as often as it's needed to match the Wakeup() requirements.
 	// The optional timeout parameter is a timeout for how periodically the payload should be called.
 	// Use timeout = 0 to run without a timeout at all.
-	template<class F> void Run(F payload, int64_t timeout = 0)
+	template<class F> void Run(F&& payload, int64_t timeout = 0)
 	{
 		// Asserts that Prepare is called at least once before we enter the loop.
 		// But a good implementation should call this before already.
@@ -128,7 +129,7 @@ public:
 
 		while (!m_shutdown.IsSet())
 		{
-			payload();
+			std::forward<F>(payload)();
 
 			switch (m_running_state.load())
 			{
